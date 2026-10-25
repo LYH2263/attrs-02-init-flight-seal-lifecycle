@@ -130,6 +130,10 @@ That means that it doesn't matter from from which namespace they've been raised 
            x: int
            y = attr.ib()  # <- ERROR!
 
+.. autoexception:: InitFlightError
+.. autoexception:: SealedAttributeError
+.. autoexception:: UnassignedAttributeError
+
 
 .. _helpers:
 
@@ -647,6 +651,74 @@ Validators can be both globally and locally disabled:
 .. autofunction:: attrs.validators.get_disabled
 
 .. autofunction:: attrs.validators.disabled
+
+
+Construction Flight
+-------------------
+
+While a generated initializer runs, the new instance passes through an observable *construction flight*:
+``pre_init`` → ``assigning`` → ``validating`` → ``post_init`` → ``ready``.
+If a converter, factory or validator raises, the instance stays in the ``aborted`` phase.
+
+.. autoclass:: attrs.InitPhase
+   :members:
+   :enum-value-annotations:
+
+.. autofunction:: attrs.get_init_phase
+
+.. autofunction:: attrs.get_init_field
+
+   The phase and the current field are attached to the instance under
+   construction, so two threads constructing different instances never
+   observe each other.
+
+   For example:
+
+   .. doctest::
+
+      >>> @define
+      ... class C:
+      ...     x: int = field(converter=attrs.Converter(
+      ...         lambda value, self: (
+      ...             attrs.get_init_phase(self).value,
+      ...             attrs.get_init_field(self),
+      ...             value,
+      ...         ),
+      ...         takes_self=True,
+      ...     ))
+      >>> c = C(42)
+      >>> c.x
+      ('assigning', 'x', 42)
+      >>> attrs.get_init_phase(c)
+      <InitPhase.READY: 'ready'>
+
+   Until ``__attrs_post_init__`` runs, hooks that receive the half-built
+   instance must not rewrite an already assigned attribute (that raises
+   `attrs.exceptions.SealedAttributeError`), nor pre-write an attribute
+   the initializer has not assigned yet (that raises
+   `attrs.exceptions.UnassignedAttributeError`) -- regardless of whether
+   they use `object.__setattr__` or the generated ``__setattr__``:
+
+   .. doctest::
+
+      >>> def attack(value, self):
+      ...     object.__setattr__(self, "x", 999)
+      ...     return value
+      >>> @define
+      ... class D:
+      ...     x: int
+      ...     y: int = field(
+      ...         converter=attrs.Converter(attack, takes_self=True)
+      ...     )
+      >>> try:
+      ...     D(1, 2)
+      ... except attrs.exceptions.SealedAttributeError as e:
+      ...     print(type(e).__name__, e.name, e.phase)
+      SealedAttributeError x assigning
+
+   `attrs.evolve` (and ``__replace__``) runs a complete new flight on the
+   new instance, while `attrs.assoc` and pickle/``__setstate__`` restore
+   storage directly and always produce ``ready`` instances.
 
 
 Converters

@@ -382,6 +382,19 @@ def evolve(inst: _T, **changes: Any) -> _T: ...
 def set_run_validators(run: bool) -> None: ...
 def get_run_validators() -> bool: ...
 
+# _flight -- construction flight lifecycle
+
+class InitPhase(str, enum.Enum):
+    PRE_INIT = "pre_init"
+    ASSIGNING = "assigning"
+    VALIDATING = "validating"
+    POST_INIT = "post_init"
+    READY = "ready"
+    ABORTED = "aborted"
+
+def get_init_phase(inst: object) -> InitPhase: ...
+def get_init_field(inst: object) -> str | None: ...
+
 # aliases --
 
 s = attributes = attrs

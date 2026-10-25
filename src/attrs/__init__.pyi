@@ -41,6 +41,9 @@ from attr import validate as validate
 from attr import validators as validators
 from attr import attrib, asdict as asdict, astuple as astuple
 from attr import NothingType as NothingType
+from attr import InitPhase as InitPhase
+from attr import get_init_field as get_init_field
+from attr import get_init_phase as get_init_phase
 
 if sys.version_info >= (3, 11):
     from typing import dataclass_transform

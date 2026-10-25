@@ -29,6 +29,33 @@ from ._compat import (
     _get_annotations,
     get_generic_base,
 )
+from ._flight import (
+    abort as _flight_abort,
+)
+from ._flight import (
+    after_hook as _flight_after_hook,
+)
+from ._flight import (
+    assign as _flight_assign,
+)
+from ._flight import (
+    begin as _flight_begin,
+)
+from ._flight import (
+    finish as _flight_finish,
+)
+from ._flight import (
+    guard_setattr as _flight_guard_setattr,
+)
+from ._flight import (
+    post_init as _flight_post_init,
+)
+from ._flight import (
+    seal as _flight_seal,
+)
+from ._flight import (
+    validating as _flight_validating,
+)
 from .exceptions import (
     DefaultAlreadySetError,
     FrozenInstanceError,
@@ -569,6 +596,12 @@ def _frozen_setattrs(self, name, value):
     ):
         BaseException.__setattr__(self, name, value)
         return
+
+    # While construction is still sealed, a hook writing through this
+    # generated __setattr__ gets the construction sealing error rather than
+    # the frozen error; after the flight, this is a no-op and the plain
+    # frozen semantics below are preserved.
+    _flight_guard_setattr(self, name)
 
     raise FrozenInstanceError
 
@@ -1180,6 +1213,12 @@ class _ClassBuilder:
 
         # docstring comes from _add_method_dunders
         def __setattr__(self, name, val):
+            # While the construction flight is still sealed, a hook using a
+            # generated __setattr__ must fail immediately; object.__setattr__
+            # bypasses this and is caught by the post-hook checks in the
+            # generated initializer instead.
+            _flight_guard_setattr(self, name)
+
             try:
                 a, hook = sa_attrs[name]
             except KeyError:
@@ -2035,6 +2074,32 @@ def _make_init_script(
         elif has_cls_on_setattr and a.on_setattr is not setters.NO_OP:
             needs_cached_setattr = True
 
+    # Construction flight metadata.  The flight is only opened when
+    # something running inside the initializer can either observe the
+    # phases or touch the half-built instance; plain classes keep the exact
+    # pinned, flight-free initializer.
+    flight_active = bool(pre_init or post_init)
+    if not flight_active:
+        for a in filtered_attrs:
+            # An empty list/tuple of validators is equivalent to None and
+            # does not produce any validator call -- hence no hook either.
+            if a.validator:
+                flight_active = True
+                break
+            if isinstance(a.default, Factory) and a.default.takes_self:
+                flight_active = True
+                break
+            if isinstance(a.converter, Converter) and a.converter.takes_self:
+                flight_active = True
+                break
+
+    flight_names = tuple(a.name for a in attrs)
+    flight_slot_names = frozenset(
+        a.name
+        for a in attrs
+        if _flight_is_slot_attr(a.name, slots, base_attr_map)
+    )
+
     script, globs, annotations = _attrs_to_init_script(
         filtered_attrs,
         frozen,
@@ -2048,6 +2113,9 @@ def _make_init_script(
         needs_cached_setattr,
         has_cls_on_setattr,
         "__attrs_init__" if attrs_init else "__init__",
+        flight_active,
+        flight_names,
+        flight_slot_names,
     )
     if cls.__module__ in sys.modules:
         # This makes typing.get_type_hints(CLS.__init__) resolve string types.
@@ -2061,6 +2129,23 @@ def _make_init_script(
         globs["_cached_setattr_get"] = _OBJ_SETATTR.__get__
 
     return script, globs, annotations
+
+
+def _flight_is_slot_attr(
+    a_name: str, is_slotted: bool, base_attr_map: dict[str, type]
+) -> bool:
+    """
+    Whether *a_name* is stored in a slot for the class being built.
+
+    Mirrors the write-target decision in `_determine_setters`: a base field
+    is a slot iff its defining class is slotted, while a field of the class
+    being built is a slot iff the class itself is slotted.
+    """
+    owner = base_attr_map.get(a_name)
+    if owner is not None:
+        return "__slots__" in owner.__dict__
+
+    return is_slotted
 
 
 def _setattr(attr_name: str, value_var: str, has_on_setattr: bool) -> str:
@@ -2164,17 +2249,28 @@ def _attrs_to_init_script(
     needs_cached_setattr: bool,
     has_cls_on_setattr: bool,
     method_name: str,
+    flight_active: bool = False,
+    flight_names: tuple = (),
+    flight_slot_names: frozenset = frozenset(),
 ) -> tuple[str, dict, dict]:
     """
     Return a script of an initializer for *attrs*, a dict of globals, and
     annotations for the initializer.
 
     The globals are required by the generated script.
+
+    When *flight_active* is true, the body is wrapped in the construction
+    flight lifecycle (see `attr._flight`): the instance moves through
+    ``pre_init`` / ``assigning`` / ``validating`` / ``post_init`` and each
+    planned assignment seals its storage name.
     """
-    lines = ["self.__attrs_pre_init__()"] if call_pre_init else []
+    # Prelude lines run before the flight (and therefore outside of its
+    # try/except): fast attribute write helpers.
+    prelude = []
+    body = []
 
     if needs_cached_setattr:
-        lines.append(
+        prelude.append(
             # Circumvent the __setattr__ descriptor to save one lookup per
             # assignment. Note _setattr will be used again below if
             # does_cache_hash is True.
@@ -2184,7 +2280,7 @@ def _attrs_to_init_script(
     extra_lines, fmt_setter, fmt_setter_with_converter = _determine_setters(
         is_frozen, is_slotted, base_attr_map
     )
-    lines.extend(extra_lines)
+    prelude.extend(extra_lines)
 
     args = []  # Parameters in the definition of __init__
     pre_init_args = []  # Parameters in the call to __attrs_pre_init__
@@ -2195,6 +2291,32 @@ def _attrs_to_init_script(
     # Injecting this into __init__ globals lets us avoid lookups.
     names_for_globals = {}
     annotations = {"return": None}
+
+    if flight_active:
+        names_for_globals.update(
+            {
+                "_flight_begin": _flight_begin,
+                "_flight_assign": _flight_assign,
+                "_flight_seal": _flight_seal,
+                "_flight_validating": _flight_validating,
+                "_flight_post_init": _flight_post_init,
+                "_flight_finish": _flight_finish,
+                "_flight_abort": _flight_abort,
+                "_flight_after_hook": _flight_after_hook,
+            }
+        )
+
+        def emit_field(name: str, block: list[str]) -> None:
+            body.append(f"_flight_assign(_flight, {name!r})")
+            body.extend(block)
+            # Verify sealing (no sealed rewrite, no early write) right after
+            # the field's factory/converter ran, then seal the field.
+            body.append("_flight_after_hook(_flight, self)")
+            body.append(f"_flight_seal(_flight, self, {name!r})")
+    else:
+
+        def emit_field(name: str, block: list[str]) -> None:
+            body.extend(block)
 
     for a in attrs:
         if a.validator:
@@ -2216,11 +2338,13 @@ def _attrs_to_init_script(
         else:
             converter = a.converter
 
+        field_lines: list[str] = []
+
         if a.init is False:
             if has_factory:
                 init_factory_name = _INIT_FACTORY_PAT % (a.name,)
                 if converter is not None:
-                    lines.append(
+                    field_lines.append(
                         fmt_setter_with_converter(
                             attr_name,
                             init_factory_name + f"({maybe_self})",
@@ -2232,7 +2356,7 @@ def _attrs_to_init_script(
                         converter.converter
                     )
                 else:
-                    lines.append(
+                    field_lines.append(
                         fmt_setter(
                             attr_name,
                             init_factory_name + f"({maybe_self})",
@@ -2241,7 +2365,7 @@ def _attrs_to_init_script(
                     )
                 names_for_globals[init_factory_name] = a.default.factory
             elif converter is not None:
-                lines.append(
+                field_lines.append(
                     fmt_setter_with_converter(
                         attr_name,
                         f"attr_dict['{attr_name}'].default",
@@ -2253,7 +2377,7 @@ def _attrs_to_init_script(
                     converter.converter
                 )
             else:
-                lines.append(
+                field_lines.append(
                     fmt_setter(
                         attr_name,
                         f"attr_dict['{attr_name}'].default",
@@ -2269,7 +2393,7 @@ def _attrs_to_init_script(
                 pre_init_args.append(arg_name)
 
             if converter is not None:
-                lines.append(
+                field_lines.append(
                     fmt_setter_with_converter(
                         attr_name, arg_name, has_on_setattr, converter
                     )
@@ -2278,7 +2402,9 @@ def _attrs_to_init_script(
                     converter.converter
                 )
             else:
-                lines.append(fmt_setter(attr_name, arg_name, has_on_setattr))
+                field_lines.append(
+                    fmt_setter(attr_name, arg_name, has_on_setattr)
+                )
 
         elif has_factory:
             arg = f"{arg_name}=NOTHING"
@@ -2287,18 +2413,18 @@ def _attrs_to_init_script(
             else:
                 args.append(arg)
                 pre_init_args.append(arg_name)
-            lines.append(f"if {arg_name} is not NOTHING:")
+            field_lines.append(f"if {arg_name} is not NOTHING:")
 
             init_factory_name = _INIT_FACTORY_PAT % (a.name,)
             if converter is not None:
-                lines.append(
+                field_lines.append(
                     "    "
                     + fmt_setter_with_converter(
                         attr_name, arg_name, has_on_setattr, converter
                     )
                 )
-                lines.append("else:")
-                lines.append(
+                field_lines.append("else:")
+                field_lines.append(
                     "    "
                     + fmt_setter_with_converter(
                         attr_name,
@@ -2311,11 +2437,11 @@ def _attrs_to_init_script(
                     converter.converter
                 )
             else:
-                lines.append(
+                field_lines.append(
                     "    " + fmt_setter(attr_name, arg_name, has_on_setattr)
                 )
-                lines.append("else:")
-                lines.append(
+                field_lines.append("else:")
+                field_lines.append(
                     "    "
                     + fmt_setter(
                         attr_name,
@@ -2332,7 +2458,7 @@ def _attrs_to_init_script(
                 pre_init_args.append(arg_name)
 
             if converter is not None:
-                lines.append(
+                field_lines.append(
                     fmt_setter_with_converter(
                         attr_name, arg_name, has_on_setattr, converter
                     )
@@ -2341,7 +2467,9 @@ def _attrs_to_init_script(
                     converter.converter
                 )
             else:
-                lines.append(fmt_setter(attr_name, arg_name, has_on_setattr))
+                field_lines.append(
+                    fmt_setter(attr_name, arg_name, has_on_setattr)
+                )
 
         if a.init is True:
             if a.type is not None and converter is None:
@@ -2350,24 +2478,60 @@ def _attrs_to_init_script(
                 # Use the type from the converter if present.
                 annotations[arg_name] = converter._first_param_type
 
+        emit_field(attr_name, field_lines)
+
     if attrs_to_validate:  # we can skip this if there are no validators.
         names_for_globals["_config"] = _config
-        lines.append("if _config._run_validators is True:")
+        validator_lines = ["if _config._run_validators is True:"]
         for a in attrs_to_validate:
             val_name = "__attr_validator_" + a.name
             attr_name = "__attr_" + a.name
-            lines.append(f"    {val_name}(self, {attr_name}, self.{a.name})")
+            validator_lines.append(
+                f"    {val_name}(self, {attr_name}, self.{a.name})"
+            )
             names_for_globals[val_name] = a.validator
             names_for_globals[attr_name] = a
+        if flight_active:
+            body.append("_flight_validating(_flight)")
+            body.extend(validator_lines)
+            # Validators may not rewrite sealed fields either.
+            body.append("_flight_after_hook(_flight, self)")
+        else:
+            body.extend(validator_lines)
+
+    if call_pre_init:
+        if pre_init_has_args:
+            # Pass the values given to __init__: positional args in order
+            # followed by the keyword-only args as name=name.
+            full_pre_args = list(pre_init_args)
+            full_pre_args.extend(
+                f"{kwa.split('=', 1)[0]}={kwa.split('=', 1)[0]}"
+                for kwa in kw_only_args
+            )
+            pre_call = f"self.__attrs_pre_init__({', '.join(full_pre_args)})"
+        else:
+            pre_call = "self.__attrs_pre_init__()"
+        pre_block = [pre_call]
+        if flight_active:
+            # begin() already entered the pre_init phase when a pre-init
+            # hook exists.
+            pre_block.append("_flight_after_hook(_flight, self)")
+        body[:0] = pre_block
 
     if call_post_init:
-        lines.append("self.__attrs_post_init__()")
+        if flight_active:
+            body.append("_flight_post_init(_flight)")
+        body.append("self.__attrs_post_init__()")
+
+    if flight_active:
+        body.append("_flight_finish(self, _flight)")
 
     # Because this is set only after __attrs_post_init__ is called, a crash
     # will result if post-init tries to access the hash code.  This seemed
     # preferable to setting this beforehand, in which case alteration to field
     # values during post-init combined with post-init accessing the hash code
     # would result in silent bugs.
+    tail_lines = []
     if does_cache_hash:
         if is_frozen:
             if is_slotted:
@@ -2376,33 +2540,34 @@ def _attrs_to_init_script(
                 init_hash_cache = f"_inst_dict['{_HASH_CACHE_FIELD}'] = None"
         else:
             init_hash_cache = f"self.{_HASH_CACHE_FIELD} = None"
-        lines.append(init_hash_cache)
+        tail_lines.append(init_hash_cache)
 
     # For exceptions we rely on BaseException.__init__ for proper
     # initialization.
     if is_exc:
         vals = ",".join(f"self.{a.name}" for a in attrs if a.init)
 
-        lines.append(f"BaseException.__init__(self, {vals})")
+        tail_lines.append(f"BaseException.__init__(self, {vals})")
 
     args = ", ".join(args)
-    pre_init_args = ", ".join(pre_init_args)
     if kw_only_args:
         # leading comma & kw_only args
         args += f"{', ' if args else ''}*, {', '.join(kw_only_args)}"
-        pre_init_kw_only_args = ", ".join(
-            [
-                f"{kw_arg_name}={kw_arg_name}"
-                # We need to remove the defaults from the kw_only_args.
-                for kw_arg_name in (kwa.split("=")[0] for kwa in kw_only_args)
-            ]
-        )
-        pre_init_args += ", " if pre_init_args else ""
-        pre_init_args += pre_init_kw_only_args
 
-    if call_pre_init and pre_init_has_args:
-        # If pre init method has arguments, pass the values given to __init__.
-        lines[0] = f"self.__attrs_pre_init__({pre_init_args})"
+    if flight_active:
+        lines = list(prelude)
+        lines.append(
+            f"_flight = _flight_begin(self, {tuple(flight_names)!r}, "
+            f"frozenset({sorted(flight_slot_names)!r}), {bool(call_pre_init)!r})"
+        )
+        lines.append("try:")
+        lines.extend(f"    {line}" if line else "    " for line in body)
+        lines.append("except:")
+        lines.append("    _flight_abort(_flight)")
+        lines.append("    raise")
+        lines.extend(tail_lines)
+    else:
+        lines = prelude + body + tail_lines
 
     # Python <3.12 doesn't allow backslashes in f-strings.
     NL = "\n    "
